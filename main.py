@@ -6,9 +6,11 @@ from contextlib import asynccontextmanager
 from urllib.parse import unquote
 import tempfile
 import os
+import mimetypes
+from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, BackgroundTasks, Depends, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, FileResponse, StreamingResponse
 from pydantic import BaseModel, HttpUrl
 from typing import Optional, Dict, Any
 
@@ -43,6 +45,7 @@ class StatusResponse(BaseModel):
     status: str
     download_directory: str
     supported_domains: Dict[str, list]
+    endpoints: Dict[str, str]
 
 # Application lifecycle management
 @asynccontextmanager
@@ -65,7 +68,7 @@ async def lifespan(app: FastAPI):
 # Initialize FastAPI app
 app = FastAPI(
     title="pyDownloader API",
-    description="A microservice for downloading content from various websites",
+    description="A microservice for downloading content from various websites. Supports both streaming files to clients (/download) and saving files to server (/save).",
     version="1.0.0",
     lifespan=lifespan
 )
@@ -73,6 +76,52 @@ app = FastAPI(
 def get_download_service() -> DownloadService:
     """Dependency injection for DownloadService - creates new instance per request."""
     return DownloadService()
+
+def get_media_type(file_path: str) -> str:
+    """Get the media type for a file based on its extension."""
+    media_type, _ = mimetypes.guess_type(file_path)
+    return media_type or 'application/octet-stream'
+
+async def stream_file_and_cleanup(file_path: str, temp_dir: str) -> FileResponse:
+    """
+    Stream a file to the client and clean up the temporary directory after streaming.
+    
+    Args:
+        file_path: Path to the file to stream
+        temp_dir: Temporary directory to clean up after streaming
+    
+    Returns:
+        FileResponse object for streaming the file
+    """
+    if not os.path.exists(file_path):
+        raise HTTPException(status_code=404, detail="Downloaded file not found")
+    
+    # Get media type for proper Content-Type header
+    media_type = get_media_type(file_path)
+    
+    # Get filename for Content-Disposition header
+    filename = os.path.basename(file_path)
+    
+    # Create a background task to clean up the temporary directory after streaming
+    def cleanup_temp_dir():
+        try:
+            import shutil
+            if os.path.exists(temp_dir):
+                shutil.rmtree(temp_dir)
+                logger.info(f"Cleaned up temporary directory: {temp_dir}")
+        except Exception as e:
+            logger.error(f"Failed to clean up temporary directory {temp_dir}: {e}")
+    
+    # Return FileResponse with cleanup task
+    response = FileResponse(
+        path=file_path,
+        media_type=media_type,
+        filename=filename,
+        background=BackgroundTasks()
+    )
+    response.background.add_task(cleanup_temp_dir)
+    
+    return response
 
 @app.get("/", response_model=StatusResponse)
 async def root():
@@ -94,24 +143,32 @@ async def root():
             "generic": ["Any HTTP/HTTPS URL"]
         }
         
+        endpoints_info = {
+            "/download": "Stream downloaded files directly to client",
+            "/save": "Download and save files to server's configured directory",
+            "/files": "List files in server's download directory",
+            "/health": "Service health check"
+        }
+        
         return StatusResponse(
             status="running",
             download_directory=config.download_directory,
-            supported_domains=supported_domains
+            supported_domains=supported_domains,
+            endpoints=endpoints_info
         )
     except Exception as e:
         logger.error(f"Error in root endpoint: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
-@app.get("/download/{url_to_download:path}", response_model=DownloadResponse)
-async def download_from_url(
+@app.get("/save/{url_to_download:path}", response_model=DownloadResponse)
+async def save_from_url(
     url_to_download: str,
     download_service: DownloadService = Depends(get_download_service),
     custom_filename: Optional[str] = None,
     request: Request = None
 ):
     """
-    Download content from the specified URL.
+    Download content from the specified URL and save it to the server's configured directory.
     
     Args:
         url_to_download: The URL to download from (URL-encoded)
@@ -218,21 +275,138 @@ async def download_from_url(
         logger.error(f"Unexpected error during download: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
 
-@app.post("/download", response_model=DownloadResponse)
-async def download_from_body(
+@app.post("/save", response_model=DownloadResponse)
+async def save_from_body(
     request: DownloadRequest,
     download_service: DownloadService = Depends(get_download_service)
 ):
     """
-    Alternative endpoint that accepts URL in request body.
+    Alternative endpoint that accepts URL in request body and saves to server's configured directory.
     
     Args:
         request: DownloadRequest containing URL and optional custom filename
     """
-    return await download_from_url(
+    return await save_from_url(
         str(request.url),
         download_service,
         request.custom_filename
+    )
+
+@app.get("/download/{url_to_download:path}")
+async def download_from_url(
+    url_to_download: str,
+    download_service: DownloadService = Depends(get_download_service),
+    custom_filename: Optional[str] = None,
+    request: Request = None
+):
+    """
+    Download content from the specified URL and stream it directly to the client.
+    
+    Args:
+        url_to_download: The URL to download from (URL-encoded)
+        custom_filename: Optional custom filename for the downloaded content
+    
+    Returns:
+        The downloaded file streamed directly to the client
+    """
+    try:
+        # URL decode the path parameter
+        decoded_url = unquote(url_to_download)
+        
+        # Reconstruct the full URL with query parameters
+        if request and request.url.query:
+            full_url = f"{decoded_url}?{request.url.query}"
+        else:
+            full_url = decoded_url
+            
+        logger.info(f"Download (streaming) request for URL: {full_url}")
+        
+        # Create temporary directory for this download
+        temp_dir = tempfile.mkdtemp()
+        logger.info(f"Using temporary directory for streaming: {temp_dir}")
+        
+        try:
+            # Perform the download
+            result = await download_service.download(full_url, temp_dir)
+            
+            if not result.success:
+                logger.error(f"Download failed: {result.error}")
+                # Clean up temp directory on failure
+                import shutil
+                shutil.rmtree(temp_dir, ignore_errors=True)
+                raise HTTPException(status_code=400, detail=f"Download failed: {result.error}")
+            
+            # Find the downloaded file to stream
+            file_to_stream = None
+            
+            if result.file_path and os.path.exists(result.file_path):
+                if os.path.isfile(result.file_path):
+                    # Single file downloaded
+                    file_to_stream = result.file_path
+                elif os.path.isdir(result.file_path):
+                    # Directory downloaded - find the first media file
+                    for item in os.listdir(result.file_path):
+                        item_path = os.path.join(result.file_path, item)
+                        if os.path.isfile(item_path):
+                            file_to_stream = item_path
+                            break
+            else:
+                # Fallback: check temp directory for any files
+                temp_files = [f for f in os.listdir(temp_dir) if os.path.isfile(os.path.join(temp_dir, f))]
+                if temp_files:
+                    file_to_stream = os.path.join(temp_dir, temp_files[0])
+            
+            if not file_to_stream:
+                # Clean up temp directory
+                import shutil
+                shutil.rmtree(temp_dir, ignore_errors=True)
+                raise HTTPException(status_code=404, detail="No downloadable content found")
+            
+            # Handle custom filename if provided
+            if custom_filename:
+                # Rename the file to use custom filename
+                file_ext = os.path.splitext(file_to_stream)[1]
+                if not custom_filename.endswith(file_ext):
+                    custom_filename += file_ext
+                new_path = os.path.join(os.path.dirname(file_to_stream), custom_filename)
+                os.rename(file_to_stream, new_path)
+                file_to_stream = new_path
+            
+            # Stream the file to client with cleanup
+            return await stream_file_and_cleanup(file_to_stream, temp_dir)
+            
+        except Exception as e:
+            # Clean up temp directory on any exception
+            import shutil
+            shutil.rmtree(temp_dir, ignore_errors=True)
+            raise
+            
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Unexpected error during download: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
+
+@app.post("/download")
+async def download_from_body(
+    request: DownloadRequest,
+    download_service: DownloadService = Depends(get_download_service),
+    req: Request = None
+):
+    """
+    Alternative endpoint that accepts URL in request body and streams file directly to client.
+    
+    Args:
+        request: DownloadRequest containing URL and optional custom filename
+    
+    Returns:
+        The downloaded file streamed directly to the client
+    """
+    return await download_from_url(
+        str(request.url),
+        download_service,
+        request.custom_filename,
+        req
     )
 
 @app.get("/files")
