@@ -1,22 +1,20 @@
 #!/usr/bin/env python3
 
 import logging
-import asyncio
 from contextlib import asynccontextmanager
 from urllib.parse import unquote
 import tempfile
 import os
 import mimetypes
-from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, BackgroundTasks, Depends, Request
-from fastapi.responses import JSONResponse, FileResponse, StreamingResponse
+from fastapi.responses import FileResponse
 from pydantic import BaseModel, HttpUrl
-from typing import Optional, Dict, Any
+from typing import Optional, Dict
 
 from config_service import ConfigService
 from file_service import FileService
-from download_service import DownloadService, DownloadResult
+from download_service import DownloadService
 
 # Configure logging
 logging.basicConfig(

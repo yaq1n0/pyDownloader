@@ -1,12 +1,10 @@
 # this files handles the downloading of files from various sources
 
 import asyncio
-import subprocess
 import logging
 from abc import ABC, abstractmethod
-from typing import Optional, Dict, Any
+from typing import Optional
 from urllib.parse import urlparse
-import tempfile
 import os
 
 logger = logging.getLogger(__name__)
